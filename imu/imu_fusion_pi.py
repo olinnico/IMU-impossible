@@ -2,10 +2,6 @@
 """
 imu_fusion_pi.py
 
-ONE FILE replacement for:
-- your Arduino sketch (.ino) that read 4 IMUs behind a TCA9548A mux
-- your Python main (App Lab Bridge) that fused them and integrated motion
-
 Hardware assumed (same as your sketch):
 - TCA9548A I2C multiplexer at 0x70
 - Four channels on the mux:
