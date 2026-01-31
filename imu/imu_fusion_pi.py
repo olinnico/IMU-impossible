@@ -396,12 +396,6 @@ class Config:
     res_warn: float = 0.8
     res_hard: float = 1.6
 
-    # Confidence update parameters
-    sat_guard: float = 0.90
-    pen_soft: float = 0.97
-    pen_hard: float = 0.90
-    recover: float = 1.002
-
     # Placeholder mag calibration
     mag_offset_uT: np.ndarray = field(default_factory=lambda: np.zeros(3))
     mag_scale: np.ndarray = field(default_factory=lambda:np.ones(3))
@@ -410,10 +404,15 @@ class Config:
     zupt_enable: bool = True
     zupt_gyro: float = 0.06      # rad/s (stricter than before)
     zupt_acc_mag: float = 0.20   # m/s^2 difference from g (stricter)
+    zupt_min_frames: int = 8     # frames required to enter "stationary"
+    zupt_release_frames: int = 3 # frames required to exit "stationary"
 
     # Bias learning when stationary
     bias_learn_enable: bool = True
     bias_learn_rate: float = 0.05
+
+    # Velocity damping (reduces drift when slightly moving)
+    vel_damping: float = 0.25    # 1/s, exponential decay of velocity
 
     # dt clamps
     dt_min: float = 0.002
@@ -428,6 +427,8 @@ cfg = Config(
         3: np.array([0.000, 0.000, 0.000], dtype=float),
     }
 )
+
+MAIN_IMU = 3
 
 
 class BiasCal4:
@@ -476,106 +477,67 @@ class BiasCal4:
 
 class Fusion:
     """
-    Confidence-weighted fusion + rigid-body least squares fit.
-
-    Goal: use 4 accelerometers placed at different positions to estimate:
-    - a0: translational acceleration at the reference point (body frame)
-    - alpha: angular acceleration
-    while accounting for centripetal term omega x (omega x r)
+    Use one "main" IMU as the primary source, and use the others to
+    validate rigid-body consistency (estimate alpha + residuals).
     """
-    def __init__(self):
-        self.conf = {i: 1.0 for i in cfg.pos}
+    @staticmethod
+    def _relative_positions(main_idx: int) -> Dict[int, np.ndarray]:
+        origin = cfg.pos[main_idx]
+        return {i: (cfg.pos[i] - origin) for i in cfg.pos}
 
-    def apply_saturation_penalty(self, acc: Dict[int, np.ndarray], accel_fs_g: Dict[int, float]) -> None:
+    def fuse_omega(self, gyr: Dict[int, np.ndarray], main_idx: int) -> np.ndarray:
         """
-        If accel magnitude approaches its full-scale, reduce its confidence.
+        Use the main IMU gyro directly.
         """
-        for i in cfg.pos:
-            fs = accel_fs_g[i] * cfg.g
-            if safe_norm(acc[i]) > cfg.sat_guard * fs:
-                self.conf[i] *= 0.90
+        return gyr[main_idx]
 
-    def fuse_omega(self, gyr: Dict[int, np.ndarray]) -> np.ndarray:
+    def estimate_alpha(self, acc: Dict[int, np.ndarray], omega: np.ndarray, main_idx: int) -> np.ndarray:
         """
-        Weighted average of gyros into one omega estimate.
+        Estimate angular acceleration using the non-main IMUs:
+
+            acc_i - acc_main - omega x (omega x r_i) = alpha x r_i
         """
-        ids = [0, 1, 2, 3]
-        w = np.array([self.conf[i] for i in ids], dtype=float)
-        ws = float(np.sum(w)) if float(np.sum(w)) > 1e-9 else 1.0
-        omega = np.zeros(3, dtype=float)
-        for idx, i in enumerate(ids):
-            omega += (w[idx] / ws) * gyr[i]
-        return omega
-
-    def rigid_body_fit(self, acc: Dict[int, np.ndarray], omega: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Solve for a0 and alpha in:
-
-            acc_i = a0 + alpha x r_i + omega x (omega x r_i)
-
-        Rearrange:
-
-            acc_i - omega x (omega x r_i) = a0 + alpha x r_i
-
-        alpha x r_i = -skew(r_i) alpha
-
-        So linear system:
-            y = [I  -skew(r)] [a0; alpha]
-        """
+        rel = self._relative_positions(main_idx)
         A, y = [], []
-        for i in [0, 1, 2, 3]:
-            r = cfg.pos[i]
+        for i in cfg.pos:
+            if i == main_idx:
+                continue
+            r = rel[i]
             c = centripetal_term(omega, r)
-            yi = acc[i] - c
-            Ai = np.hstack([np.eye(3), -skew(r)])
+            yi = acc[i] - acc[main_idx] - c
+            Ai = -skew(r)
             A.append(Ai)
             y.append(yi.reshape(3, 1))
 
+        if not A:
+            return np.zeros(3, dtype=float)
+
         A = np.vstack(A)
         y = np.vstack(y).ravel()
-
-        x = np.linalg.lstsq(A, y, rcond=None)[0]
-        a0 = x[0:3]
-        alpha = x[3:6]
-        return a0, alpha
+        alpha = np.linalg.lstsq(A, y, rcond=None)[0]
+        return alpha
 
     def residual_norms(self, acc: Dict[int, np.ndarray], omega: np.ndarray,
-                       a0: np.ndarray, alpha: np.ndarray) -> Dict[int, float]:
+                       a0: np.ndarray, alpha: np.ndarray, main_idx: int) -> Dict[int, float]:
         """
         Compute per-IMU residual error for consistency scoring.
         """
+        rel = self._relative_positions(main_idx)
         norms = {}
-        for i in [0, 1, 2, 3]:
-            r = cfg.pos[i]
+        for i in cfg.pos:
+            if i == main_idx:
+                norms[i] = 0.0
+                continue
+            r = rel[i]
             pred = a0 + np.cross(alpha, r) + centripetal_term(omega, r)
             norms[i] = float(np.linalg.norm(acc[i] - pred))
         return norms
 
-    def update_conf(self, norms: Dict[int, float]) -> None:
+    def fuse_mag(self, mag: Dict[int, np.ndarray], main_idx: int) -> np.ndarray:
         """
-        Reduce confidence for sensors with large residuals, recover slowly otherwise.
+        Use the main IMU magnetometer directly.
         """
-        for i, e in norms.items():
-            if e > cfg.res_hard:
-                self.conf[i] *= cfg.pen_hard
-            elif e > cfg.res_warn:
-                self.conf[i] *= cfg.pen_soft
-            else:
-                self.conf[i] = min(1.0, self.conf[i] * cfg.recover)
-            self.conf[i] = clamp(self.conf[i], 0.05, 1.0)
-
-    def fuse_mag(self, mag: Dict[int, np.ndarray]) -> np.ndarray:
-        """
-        Weighted average magnetometer (only channels with mag).
-        """
-        ids = [0, 1, 3]
-        w = np.array([self.conf[i] for i in ids], dtype=float)
-        ws = float(np.sum(w)) if float(np.sum(w)) > 1e-9 else 1.0
-        w = w / ws
-        m = np.zeros(3, dtype=float)
-        for idx, i in enumerate(ids):
-            m += w[idx] * mag[i]
-        return m
+        return mag[main_idx]
 
 
 class Integrator:
@@ -592,12 +554,18 @@ class Integrator:
         self.p = np.zeros(3, dtype=float)
         self.b_aw = np.zeros(3, dtype=float)
         self.a_prev = np.zeros(3, dtype=float)
+        self.stationary = False
+        self.stationary_count = 0
+        self.moving_count = 0
 
     def reset(self) -> None:
         self.v[:] = 0.0
         self.p[:] = 0.0
         self.b_aw[:] = 0.0
         self.a_prev[:] = 0.0
+        self.stationary = False
+        self.stationary_count = 0
+        self.moving_count = 0
 
     def zupt(self, a_body: np.ndarray, omega: np.ndarray, residual_ok: bool) -> bool:
         """
@@ -606,6 +574,7 @@ class Integrator:
         - accel magnitude close to g
         - rigid-body residuals ok
 
+        Uses a small hysteresis window so "still" doesn't flicker.
         If stationary, we clamp v=0.
         """
         if not cfg.zupt_enable:
@@ -615,9 +584,20 @@ class Integrator:
                 abs(safe_norm(a_body) - cfg.g) < cfg.zupt_acc_mag and
                 residual_ok)
         if cond:
+            self.stationary_count += 1
+            self.moving_count = 0
+        else:
+            self.moving_count += 1
+            self.stationary_count = 0
+
+        if not self.stationary and self.stationary_count >= cfg.zupt_min_frames:
+            self.stationary = True
+        elif self.stationary and self.moving_count >= cfg.zupt_release_frames:
+            self.stationary = False
+
+        if self.stationary:
             self.v[:] = 0.0
-            return True
-        return False
+        return self.stationary
 
     def step(self, a_body: np.ndarray, Rwb: np.ndarray, dt: float, stationary: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -644,6 +624,8 @@ class Integrator:
 
         if not stationary:
             self.v += 0.5 * (self.a_prev + a_lin) * dt
+            if cfg.vel_damping > 0.0:
+                self.v *= math.exp(-cfg.vel_damping * dt)
 
         self.p += self.v * dt
         self.a_prev = a_lin
@@ -660,10 +642,6 @@ def main() -> None:
     # Open I2C bus 1 (typical on Raspberry Pi)
     with SMBus(1) as bus:
         mux = TCA9548A(bus, TCA_ADDR)
-
-        # Describe your sensor set
-        # accel_fs_g used only for saturation confidence (match your ranges)
-        accel_fs_g = {0: 16.0, 1: 16.0, 2: 2.0, 3: 16.0}
 
         # Create the 4 IMU objects
         imus = {
@@ -743,16 +721,14 @@ def main() -> None:
             # Bias-corrected sensor values
             acc, gyr, mag = cal.correct(acc_raw, gyr_raw, mag_raw)
 
-            # Confidence + rigid-body fit
-            fuse.apply_saturation_penalty(acc, accel_fs_g)
-            omega = fuse.fuse_omega(gyr)
+            # Main IMU provides primary motion; others validate consistency
+            omega = fuse.fuse_omega(gyr, MAIN_IMU)
+            a0_body = acc[MAIN_IMU]
+            alpha = fuse.estimate_alpha(acc, omega, MAIN_IMU)
+            norms = fuse.residual_norms(acc, omega, a0_body, alpha, MAIN_IMU)
 
-            a0_body, alpha = fuse.rigid_body_fit(acc, omega)
-            norms = fuse.residual_norms(acc, omega, a0_body, alpha)
-            fuse.update_conf(norms)
-
-            # Mag fusion (optional yaw correction)
-            m_fused = fuse.fuse_mag(mag)
+            # Mag from main IMU (optional yaw correction)
+            m_fused = fuse.fuse_mag(mag, MAIN_IMU)
             use_mag = safe_norm(m_fused) > 1e-3
 
             # Attitude update uses a0_body (translation accel estimate)
