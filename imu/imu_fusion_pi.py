@@ -7,11 +7,11 @@ Hardware assumed (same as your sketch):
 - Four channels on the mux:
     ch0: MPU9250 (accel ±16g) + AK8963 mag, pos (80,80,10) mm
     ch1: MPU9250 (accel ±16g) + AK8963 mag, pos (80,0,15) mm
-    ch2: MPU6050 (accel ±2g)  NO mag,          pos (0,80,5) mm
+    ch2: MPU9050 (accel ±2g) + AK8963 mag, pos (0,80,5) mm
     ch3: MPU9250 (accel ±16g) + AK8963 mag, pos (0,0,0) mm
 
 Addresses:
-- MPU9250/MPU6050: 0x68
+- MPU9250/MPU9050: 0x68
 - AK8963: 0x0C (reachable only when BYPASS is enabled in the MPU9250)
 
 Units:
@@ -48,7 +48,7 @@ TCA_ADDR = 0x70
 MPU_ADDR = 0x68
 MAG_ADDR = 0x0C  # AK8963
 
-# MPU registers (MPU6050/MPU9250 share these)
+# MPU registers (MPU9050/MPU9250 share these)
 REG_PWR_MGMT_1   = 0x6B
 REG_GYRO_CONFIG  = 0x1B
 REG_ACCEL_CONFIG = 0x1C
@@ -129,12 +129,12 @@ class TCA9548A:
 
 
 # ============================================================
-# MPU6050 / MPU9250 driver (what your .ino did)
+# MPU9050 / MPU9250 driver (what your .ino did)
 # ============================================================
 
 class MPUBase:
     """
-    Driver for MPU6050 or MPU9250 main IMU registers.
+    Driver for MPU9050 or MPU9250 main IMU registers.
     Note: the MPU9250 magnetometer AK8963 is a separate device read at 0x0C,
     and only accessible when bypass is enabled (INT_PIN_CFG bit1).
     """
@@ -665,7 +665,7 @@ def main() -> None:
         imus = {
             0: MPUBase(bus, mux, ch=0, accel_16g=True,  has_mag=True),
             1: MPUBase(bus, mux, ch=1, accel_16g=True,  has_mag=True),
-            2: MPUBase(bus, mux, ch=2, accel_16g=False, has_mag=False),
+            2: MPUBase(bus, mux, ch=2, accel_16g=False, has_mag=True),
             3: MPUBase(bus, mux, ch=3, accel_16g=True,  has_mag=True),
         }
 
