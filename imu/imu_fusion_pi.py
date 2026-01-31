@@ -40,6 +40,7 @@ Anchor / Grid calibration mode (optional):
     "zero"              -> anchor at (0,0,0)
     "print"             -> print current p, v, and last anchor
 - Anchors only apply after the rig is stationary for anchor_stationary_hold_s.
+- If anchor_prompt_calibration is True, press Enter to start calibration.
 """
 
 import time
@@ -427,6 +428,7 @@ class Config:
 
     # Anchor / grid calibration mode
     anchor_mode_enable: bool = False
+    anchor_prompt_calibration: bool = True
     anchor_units_in_meters: float = 0.01
     anchor_stationary_hold_s: float = 1.0
     anchor_pos_gain: float = 1.0
@@ -776,6 +778,13 @@ def main() -> None:
         fuse = Fusion()
         ahrs = MahonyAHRS(kp=2.5, ki=0.05)
         integ = Integrator()
+        if cfg.anchor_mode_enable and cfg.anchor_prompt_calibration:
+            print("Anchor mode enabled. Press Enter to start calibration...")
+            try:
+                input()
+            except EOFError:
+                pass
+
         anchor_input = AnchorInput() if cfg.anchor_mode_enable else None
         anchor_mgr = AnchorManager() if cfg.anchor_mode_enable else None
 
