@@ -389,8 +389,6 @@ def main() -> None:
                 )
                 lines.append(
                     f"IMU{ch}: ax={ax:+7.3f} m/s^2  "
-                    f"gyro=[{gx:+6.3f},{gy:+6.3f},{gz:+6.3f}] rad/s  "
-                    f"mag=[{mx:+6.1f},{my:+6.1f},{mz:+6.1f}] uT  "
                     f"kalman_rpy=[{roll_k:+6.1f},{pitch_k:+6.1f},{yaw_k:+6.1f}] deg"
                 )
             if lines:
