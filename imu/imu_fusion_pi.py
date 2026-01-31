@@ -32,12 +32,23 @@ Enable I2C on Pi:
 
 Run:
 - python3 imu_fusion_pi.py
+
+Anchor / Grid calibration mode (optional):
+- Enable in Config with anchor_mode_enable = True.
+- Commands via stdin while running:
+    "a x y" or "a x y z" -> set anchor in grid units
+    "zero"              -> anchor at (0,0,0)
+    "print"             -> print current p, v, and last anchor
+- Anchors only apply after the rig is stationary for anchor_stationary_hold_s.
 """
 
 import time
 import math
+import sys
+import threading
+import queue
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 
 import numpy as np
 from smbus2 import SMBus, i2c_msg
@@ -414,6 +425,15 @@ class Config:
     # Velocity damping (reduces drift when slightly moving)
     vel_damping: float = 0.25    # 1/s, exponential decay of velocity
 
+    # Anchor / grid calibration mode
+    anchor_mode_enable: bool = False
+    anchor_units_in_meters: float = 0.01
+    anchor_stationary_hold_s: float = 1.0
+    anchor_pos_gain: float = 1.0
+    anchor_bias_tune_enable: bool = False
+    anchor_bias_gain: float = 0.02
+    anchor_bias_max: float = 0.30
+
     # dt clamps
     dt_min: float = 0.002
     dt_max: float = 0.05
@@ -429,6 +449,90 @@ cfg = Config(
 )
 
 MAIN_IMU = 3
+
+
+class AnchorInput:
+    """
+    Background stdin reader to avoid blocking the main loop.
+    """
+    def __init__(self):
+        self.queue: "queue.Queue" = queue.Queue()
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+
+    def _reader(self) -> None:
+        for line in sys.stdin:
+            self.queue.put(line.strip())
+
+    def poll(self) -> Optional[str]:
+        try:
+            return self.queue.get_nowait()
+        except queue.Empty:
+            return None
+
+
+class AnchorManager:
+    """
+    Handle anchor commands and apply position corrections when stationary.
+    """
+    def __init__(self):
+        self.pending_anchor_m: Optional[np.ndarray] = None
+        self.last_anchor_m: Optional[np.ndarray] = None
+        self.last_delta_m: Optional[np.ndarray] = None
+        self.last_applied: bool = False
+        self.print_requested: bool = False
+
+    def _parse_anchor(self, parts: List[str]) -> Optional[np.ndarray]:
+        if len(parts) not in (3, 4):
+            return None
+        try:
+            coords = [float(p) for p in parts[1:]]
+        except ValueError:
+            return None
+        if len(coords) == 2:
+            coords.append(0.0)
+        return np.array(coords, dtype=float) * cfg.anchor_units_in_meters
+
+    def handle_command(self, cmd: str) -> None:
+        parts = cmd.strip().split()
+        if not parts:
+            return
+        key = parts[0].lower()
+        if key == "a":
+            anchor = self._parse_anchor(parts)
+            if anchor is not None:
+                self.pending_anchor_m = anchor
+                print(f"[ANCHOR] pending set to {anchor}")
+            else:
+                print("[ANCHOR] invalid format. Use: a x y [z]")
+        elif key == "zero":
+            self.pending_anchor_m = np.zeros(3, dtype=float)
+            print("[ANCHOR] pending set to [0,0,0]")
+        elif key == "print":
+            self.print_requested = True
+        else:
+            print(f"[ANCHOR] unknown command: {cmd}")
+
+    def apply_if_ready(self, integ: "Integrator", stationary: bool, stationary_time: float) -> None:
+        self.last_applied = False
+        if self.pending_anchor_m is None:
+            return
+        if not (stationary and stationary_time >= cfg.anchor_stationary_hold_s):
+            return
+        desired = self.pending_anchor_m
+        current = integ.p.copy()
+        delta = desired - current
+        gain = clamp(cfg.anchor_pos_gain, 0.0, 1.0)
+        integ.p = current + gain * delta
+        integ.v[:] = 0.0
+        self.last_anchor_m = integ.p.copy()
+        self.last_delta_m = delta
+        self.last_applied = True
+        self.pending_anchor_m = None
+        if cfg.anchor_bias_tune_enable:
+            bias_adjust = -cfg.anchor_bias_gain * delta
+            integ.b_aw += np.clip(bias_adjust, -cfg.anchor_bias_max, cfg.anchor_bias_max)
+        print(f"[ANCHOR] applied, delta={delta}, new p={integ.p}")
 
 
 class BiasCal4:
@@ -672,12 +776,15 @@ def main() -> None:
         fuse = Fusion()
         ahrs = MahonyAHRS(kp=2.5, ki=0.05)
         integ = Integrator()
+        anchor_input = AnchorInput() if cfg.anchor_mode_enable else None
+        anchor_mgr = AnchorManager() if cfg.anchor_mode_enable else None
 
         print(f"Collecting {cfg.cal_frames} stationary frames for bias... keep still")
 
         # Timing
         t_prev = time.perf_counter()
         frame = 0
+        stationary_time = 0.0
 
         # Main loop
         while True:
@@ -738,19 +845,46 @@ def main() -> None:
             # Stationary decision for ZUPT
             residual_ok = (max(norms.values()) < cfg.res_warn)
             stationary = integ.zupt(a0_body, omega, residual_ok)
+            stationary_time = (stationary_time + dt) if stationary else 0.0
+
+            if cfg.anchor_mode_enable and anchor_input and anchor_mgr:
+                while True:
+                    cmd = anchor_input.poll()
+                    if cmd is None:
+                        break
+                    anchor_mgr.handle_command(cmd)
+                anchor_mgr.apply_if_ready(integ, stationary, stationary_time)
 
             # Integrate
             p, v, a_lin_w = integ.step(a0_body, Rwb, dt, stationary=stationary)
 
             # Minimal print (every 10 frames)
             if frame % 10 == 0:
-                # Report only what you said you care about:
-                # world-frame linear accel, velocity, position, plus "still" and dt
+                if cfg.anchor_mode_enable and anchor_mgr:
+                    anchor = anchor_mgr.last_anchor_m
+                    anchor_str = "None" if anchor is None else f"[{anchor[0]:+7.3f},{anchor[1]:+7.3f},{anchor[2]:+7.3f}]"
+                    print(
+                        f"p [{p[0]:+7.3f},{p[1]:+7.3f},{p[2]:+7.3f}]  "
+                        f"anchor {anchor_str}  still={stationary}  "
+                        f"applied={anchor_mgr.last_applied}  dt={dt*1000:5.1f}ms"
+                    )
+                else:
+                    # Report only what you said you care about:
+                    # world-frame linear accel, velocity, position, plus "still" and dt
+                    print(
+                        # f"a_xy [{a_lin_w[0]:+7.3f},{a_lin_w[1]:+7.3f}]  "
+                        # f"v_xy [{v[0]:+7.3f},{v[1]:+7.3f}]  "
+                        f"p_xy [{p[0]:+7.3f},{p[1]:+7.3f}]  "
+                        f"still={stationary}  dt={dt*1000:5.1f}ms"
+                    )
+
+            if cfg.anchor_mode_enable and anchor_mgr and anchor_mgr.print_requested:
+                anchor_mgr.print_requested = False
+                anchor = anchor_mgr.last_anchor_m
+                anchor_str = "None" if anchor is None else f"[{anchor[0]:+7.3f},{anchor[1]:+7.3f},{anchor[2]:+7.3f}]"
                 print(
-                    # f"a_xy [{a_lin_w[0]:+7.3f},{a_lin_w[1]:+7.3f}]  "
-                    # f"v_xy [{v[0]:+7.3f},{v[1]:+7.3f}]  "
-                    f"p_xy [{p[0]:+7.3f},{p[1]:+7.3f}]  "
-                    f"still={stationary}  dt={dt*1000:5.1f}ms"
+                    f"[ANCHOR] p={p} v={v} anchor={anchor_str} still={stationary} "
+                    f"stationary_s={stationary_time:.2f}"
                 )
 
             time.sleep(0.005)
