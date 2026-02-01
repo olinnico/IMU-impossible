@@ -13,6 +13,7 @@ Output:
 - Prints X-axis acceleration (m/s^2) for each IMU.
 - Optional +X/-X calibration saved to imu_x_calibration.json.
 - Optional per-IMU gyro/mag readings and Kalman-filtered roll/pitch/yaw.
+- Optional fused X-axis acceleration using a scalar Kalman filter over 4 IMUs.
 
 Notes:
 - This script uses direct smbus2 I2C reads (not imusensor.MPU9250) to support the
@@ -29,7 +30,7 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 from smbus2 import SMBus, i2c_msg
 
@@ -55,6 +56,7 @@ G_MPS2 = 9.81
 DEG2RAD = math.pi / 180.0
 
 CALIBRATION_PATH = Path(__file__).with_name("imu_x_calibration.json")
+KF_R_DEFAULT_VARIANCE = 0.2 ** 2
 
 
 @dataclass
@@ -158,6 +160,74 @@ def mag_to_yaw_deg(mag: Tuple[float, float, float], roll_deg: float, pitch_deg: 
     xh = mx * math.cos(pitch) + mz * math.sin(pitch)
     yh = mx * math.sin(roll) * math.sin(pitch) + my * math.cos(roll) - mz * math.sin(roll) * math.cos(pitch)
     return math.degrees(math.atan2(-yh, xh))
+
+
+class ScalarAccelKF:
+    def __init__(self, r_matrix: List[List[float]], q: float) -> None:
+        self.r_matrix = r_matrix
+        self.q = q
+        self.a_hat = 0.0
+        self.p = 1.0
+        self.initialized = False
+
+    def predict(self) -> None:
+        self.p += self.q
+
+    def update(self, measurements: List[float]) -> float:
+        if not self.initialized:
+            self.a_hat = sum(measurements) / len(measurements)
+            self.initialized = True
+        self.predict()
+        s_matrix = add_scalar_times_ones(self.r_matrix, self.p)
+        s_inv = invert_4x4(s_matrix)
+        k = [self.p * sum(s_inv[row][col] for row in range(4)) for col in range(4)]
+        residual = [z - self.a_hat for z in measurements]
+        self.a_hat += sum(k[i] * residual[i] for i in range(4))
+        self.p *= 1.0 - sum(k)
+        return self.a_hat
+
+
+def add_scalar_times_ones(matrix: List[List[float]], scalar: float) -> List[List[float]]:
+    return [[matrix[r][c] + scalar for c in range(4)] for r in range(4)]
+
+
+def invert_4x4(matrix: List[List[float]]) -> List[List[float]]:
+    size = 4
+    augmented = [row[:] + [1.0 if i == j else 0.0 for j in range(size)] for i, row in enumerate(matrix)]
+    for col in range(size):
+        pivot_row = max(range(col, size), key=lambda r: abs(augmented[r][col]))
+        if abs(augmented[pivot_row][col]) < 1e-12:
+            raise ValueError("Matrix is singular and cannot be inverted.")
+        augmented[col], augmented[pivot_row] = augmented[pivot_row], augmented[col]
+        pivot = augmented[col][col]
+        augmented[col] = [val / pivot for val in augmented[col]]
+        for row in range(size):
+            if row == col:
+                continue
+            factor = augmented[row][col]
+            augmented[row] = [
+                augmented[row][i] - factor * augmented[col][i] for i in range(size * 2)
+            ]
+    return [row[size:] for row in augmented]
+
+
+def load_kf_r_matrix(path: Path) -> List[List[float]]:
+    data = json.loads(path.read_text())
+    if len(data) != 4 or any(len(row) != 4 for row in data):
+        raise ValueError("Acceleration KF R matrix must be a 4x4 list.")
+    return [[float(val) for val in row] for row in data]
+
+
+def default_kf_r_matrix(variance: float) -> List[List[float]]:
+    return [[variance if i == j else 0.0 for j in range(4)] for i in range(4)]
+
+
+def compute_fused_variance(r_matrix: List[List[float]]) -> float:
+    r_inv = invert_4x4(r_matrix)
+    denom = sum(sum(r_inv[row][col] for row in range(4)) for col in range(4))
+    if denom <= 0.0:
+        raise ValueError("Invalid R matrix; fused variance denominator must be positive.")
+    return 1.0 / denom
 
 
 class TCA9548A:
@@ -285,6 +355,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable AK8963 magnetometer reads (enabled by default for MPU9250).",
     )
+    parser.add_argument(
+        "--accel-kf",
+        action="store_true",
+        help="Fuse X-axis acceleration from all IMUs with a scalar Kalman filter.",
+    )
+    parser.add_argument(
+        "--accel-kf-r",
+        type=Path,
+        help="Path to JSON 4x4 covariance matrix for accel KF measurement noise.",
+    )
+    parser.add_argument(
+        "--accel-kf-r-diag",
+        type=float,
+        default=KF_R_DEFAULT_VARIANCE,
+        help="Diagonal variance for accel KF when no R matrix is provided (default: 0.04).",
+    )
+    parser.add_argument(
+        "--accel-kf-q",
+        type=float,
+        help="Process noise variance Q for accel KF (default: use fused variance from R).",
+    )
     return parser.parse_args()
 
 
@@ -368,12 +459,23 @@ def main() -> None:
             save_calibration(calibration)
             print(f"Saved calibration to {CALIBRATION_PATH}")
             return
+        accel_kf = None
+        if args.accel_kf:
+            if args.accel_kf_r:
+                r_matrix = load_kf_r_matrix(args.accel_kf_r)
+            else:
+                r_matrix = default_kf_r_matrix(args.accel_kf_r_diag)
+            q_value = args.accel_kf_q
+            if q_value is None:
+                q_value = compute_fused_variance(r_matrix)
+            accel_kf = ScalarAccelKF(r_matrix, q_value)
         t_prev = time.perf_counter()
         while True:
             t_now = time.perf_counter()
             dt = max(0.001, t_now - t_prev)
             t_prev = t_now
             lines = []
+            accel_samples = []
             for ch in sorted(imus):
                 try:
                     ax, ay, az = imus[ch].read_accel_mps2()
@@ -385,6 +487,7 @@ def main() -> None:
                     continue
                 cal = calibration.get(ch, XCalibration())
                 ax = (ax - cal.offset) * cal.scale
+                accel_samples.append(ax)
                 roll_meas, pitch_meas = accel_to_roll_pitch_deg((ax, ay, az))
                 yaw_meas = mag_to_yaw_deg((mx, my, mz), roll_meas, pitch_meas)
                 gyro_dps = (gx / DEG2RAD, gy / DEG2RAD, gz / DEG2RAD)
@@ -396,7 +499,11 @@ def main() -> None:
                     f"kalman_rpy=[{roll_k:+6.1f},{pitch_k:+6.1f},{yaw_k:+6.1f}] deg"
                 )
             if lines:
-                print("  ".join(lines))
+                if accel_kf and len(accel_samples) == 4:
+                    fused_ax = accel_kf.update(accel_samples)
+                    print(f"FUSED ax={fused_ax:+7.3f} m/s^2  " + "  ".join(lines))
+                else:
+                    print("  ".join(lines))
             time.sleep(0.05)
 
 
