@@ -68,7 +68,6 @@ def i2c_read_bytes(bus: SMBus, addr: int, reg: int, n: int, retries: int = 3) ->
             time.sleep(0.005)
     raise IOError(f"I2C read failed addr=0x{addr:02X} reg=0x{reg:02X} n={n}")
 
-
 def be16_to_i16(b_hi: int, b_lo: int) -> int:
     v = (b_hi << 8) | b_lo
 @@ -93,53 +106,140 @@ class MPU9050:
