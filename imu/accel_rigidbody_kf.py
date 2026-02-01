@@ -20,7 +20,7 @@ from imusensor.filters import kalman
 # ============================
 
 TCA_ADDR = 0x70
-IMU_ADDR = 0x69          # change to 0x68 if your MPU9250s are strapped that way
+IMU_ADDR = 0x68          # change to 0x68 if your MPU9250s are strapped that way
 IMU_CHANNELS = [0, 1, 2, 3]  # CH0..CH3
 
 class TCA9546A:
