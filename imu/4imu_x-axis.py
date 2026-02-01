@@ -2,11 +2,11 @@
 """
 imu_x_accel_4x_mpu9050.py
 
-Reads X-axis acceleration from four MPU9250 IMUs behind a TCA9548A I2C mux.
+Reads X-axis acceleration from four MPU9050 IMUs behind a TCA9548A I2C mux.
 
 Assumed hardware (based on repo context):
 - TCA9548A I2C multiplexer at 0x70
-- Four MPU9250 IMUs at address 0x68
+- Four MPU9050 IMUs at address 0x68
 - IMUs connected to mux channels 0..3
 
 Output:
@@ -33,28 +33,9 @@ MPU_ADDR = 0x68
 REG_PWR_MGMT_1 = 0x6B
 REG_ACCEL_CONFIG = 0x1C
 REG_ACCEL_XOUT_H = 0x3B
-REG_GYRO_CONFIG = 0x1B
-REG_GYRO_XOUT_H = 0x43
-REG_INT_PIN_CFG = 0x37  # bypass enable bit
 
-MAG_ADDR = 0x0C
-AK8963_ST1 = 0x02
-AK8963_XOUT_L = 0x03
-AK8963_ST2 = 0x09
-AK8963_CNTL1 = 0x0A
-
-ACCEL_LSB_PER_G_16G = 2048.0
-GYRO_LSB_PER_DPS_250 = 131.0
+ACCEL_LSB_PER_G_2G = 16384.0
 G_MPS2 = 9.81
-DEG2RAD = math.pi / 180.0
-
-CALIBRATION_PATH = Path(__file__).with_name("imu_x_calibration.json")
-
-
-@dataclass
-class XCalibration:
-    offset: float = 0.0
-    scale: float = 1.0
 
 CALIBRATION_PATH = Path(__file__).with_name("imu_x_calibration.json")
 
@@ -92,76 +73,6 @@ def be16_to_i16(b_hi: int, b_lo: int) -> int:
     return v - 65536 if v & 0x8000 else v
 
 
-def le16_to_i16(b_lo: int, b_hi: int) -> int:
-    v = (b_hi << 8) | b_lo
-    return v - 65536 if v & 0x8000 else v
-
-
-class Kalman1D:
-    def __init__(self, q_angle: float = 0.001, q_bias: float = 0.003, r_measure: float = 0.03):
-        self.q_angle = q_angle
-        self.q_bias = q_bias
-        self.r_measure = r_measure
-        self.angle = 0.0
-        self.bias = 0.0
-        self.rate = 0.0
-        self.p = [[0.0, 0.0], [0.0, 0.0]]
-
-    def update(self, new_angle: float, new_rate: float, dt: float) -> float:
-        self.rate = new_rate - self.bias
-        self.angle += dt * self.rate
-
-        self.p[0][0] += dt * (dt * self.p[1][1] - self.p[0][1] - self.p[1][0] + self.q_angle)
-        self.p[0][1] -= dt * self.p[1][1]
-        self.p[1][0] -= dt * self.p[1][1]
-        self.p[1][1] += self.q_bias * dt
-
-        s = self.p[0][0] + self.r_measure
-        k0 = self.p[0][0] / s
-        k1 = self.p[1][0] / s
-        y = new_angle - self.angle
-        self.angle += k0 * y
-        self.bias += k1 * y
-
-        p00 = self.p[0][0]
-        p01 = self.p[0][1]
-        self.p[0][0] -= k0 * p00
-        self.p[0][1] -= k0 * p01
-        self.p[1][0] -= k1 * p00
-        self.p[1][1] -= k1 * p01
-        return self.angle
-
-
-class KalmanRPY:
-    def __init__(self) -> None:
-        self.roll = Kalman1D()
-        self.pitch = Kalman1D()
-        self.yaw = Kalman1D()
-
-    def update(self, roll_meas: float, pitch_meas: float, yaw_meas: float,
-               gyro_dps: Tuple[float, float, float], dt: float) -> Tuple[float, float, float]:
-        roll = self.roll.update(roll_meas, gyro_dps[0], dt)
-        pitch = self.pitch.update(pitch_meas, gyro_dps[1], dt)
-        yaw = self.yaw.update(yaw_meas, gyro_dps[2], dt)
-        return roll, pitch, yaw
-
-
-def accel_to_roll_pitch_deg(accel: Tuple[float, float, float]) -> Tuple[float, float]:
-    ax, ay, az = accel
-    roll = math.degrees(math.atan2(ay, az))
-    pitch = math.degrees(math.atan2(-ax, math.sqrt(ay * ay + az * az)))
-    return roll, pitch
-
-
-def mag_to_yaw_deg(mag: Tuple[float, float, float], roll_deg: float, pitch_deg: float) -> float:
-    mx, my, mz = mag
-    roll = math.radians(roll_deg)
-    pitch = math.radians(pitch_deg)
-    xh = mx * math.cos(pitch) + mz * math.sin(pitch)
-    yh = mx * math.sin(roll) * math.sin(pitch) + my * math.cos(roll) - mz * math.sin(roll) * math.cos(pitch)
-    return math.degrees(math.atan2(-yh, xh))
-
-
 class TCA9548A:
     def __init__(self, bus: SMBus, addr: int = TCA_ADDR):
         self.bus = bus
@@ -179,81 +90,31 @@ class TCA9548A:
 
 
 class MPU9050:
-    def __init__(self, bus: SMBus, mux: TCA9548A, channel: int, enable_mag: bool = False):
+    def __init__(self, bus: SMBus, mux: TCA9548A, channel: int):
         self.bus = bus
         self.mux = mux
         self.channel = channel
-        self.enable_mag = enable_mag
         self.ready = False
 
     def init_device(self) -> None:
         self.mux.select(self.channel)
         i2c_write_byte(self.bus, MPU_ADDR, REG_PWR_MGMT_1, 0x00)
         time.sleep(0.05)
-        i2c_write_byte(self.bus, MPU_ADDR, REG_ACCEL_CONFIG, 0x18)
+        i2c_write_byte(self.bus, MPU_ADDR, REG_ACCEL_CONFIG, 0x00)
         time.sleep(0.01)
-        i2c_write_byte(self.bus, MPU_ADDR, REG_GYRO_CONFIG, 0x00)
-        time.sleep(0.01)
-        if self.enable_mag:
-            i2c_write_byte(self.bus, MPU_ADDR, REG_INT_PIN_CFG, 0x02)
-            time.sleep(0.01)
-            i2c_write_byte(self.bus, MAG_ADDR, AK8963_CNTL1, 0x00)
-            time.sleep(0.01)
-            i2c_write_byte(self.bus, MAG_ADDR, AK8963_CNTL1, 0x16)
-            time.sleep(0.01)
         self.ready = True
 
-    def read_accel_mps2(self) -> Tuple[float, float, float]:
-        if not self.ready:
-            raise RuntimeError("IMU not initialized")
-        self.mux.select(self.channel)
-        data = i2c_read_bytes(self.bus, MPU_ADDR, REG_ACCEL_XOUT_H, 6)
-        ax = be16_to_i16(data[0], data[1])
-        ay = be16_to_i16(data[2], data[3])
-        az = be16_to_i16(data[4], data[5])
-        return (
-            (ax / ACCEL_LSB_PER_G_16G) * G_MPS2,
-            (ay / ACCEL_LSB_PER_G_16G) * G_MPS2,
-            (az / ACCEL_LSB_PER_G_16G) * G_MPS2,
-        )
-
     def read_accel_x_mps2(self) -> float:
-        ax, _, _ = self.read_accel_mps2()
-        return ax
-
-    def read_gyro_rad(self) -> Tuple[float, float, float]:
         if not self.ready:
             raise RuntimeError("IMU not initialized")
         self.mux.select(self.channel)
-        data = i2c_read_bytes(self.bus, MPU_ADDR, REG_GYRO_XOUT_H, 6)
-        gx = be16_to_i16(data[0], data[1])
-        gy = be16_to_i16(data[2], data[3])
-        gz = be16_to_i16(data[4], data[5])
-        gx_dps = gx / GYRO_LSB_PER_DPS_250
-        gy_dps = gy / GYRO_LSB_PER_DPS_250
-        gz_dps = gz / GYRO_LSB_PER_DPS_250
-        return gx_dps * DEG2RAD, gy_dps * DEG2RAD, gz_dps * DEG2RAD
-
-    def read_mag_ut(self) -> Tuple[float, float, float]:
-        if not self.enable_mag:
-            return 0.0, 0.0, 0.0
-        self.mux.select(self.channel)
-        st1 = i2c_read_bytes(self.bus, MAG_ADDR, AK8963_ST1, 1)[0]
-        if (st1 & 0x01) == 0:
-            return 0.0, 0.0, 0.0
-        data = i2c_read_bytes(self.bus, MAG_ADDR, AK8963_XOUT_L, 7)
-        x = le16_to_i16(data[0], data[1])
-        y = le16_to_i16(data[2], data[3])
-        z = le16_to_i16(data[4], data[5])
-        st2 = data[6]
-        if st2 & 0x08:
-            return 0.0, 0.0, 0.0
-        ut_per_lsb = 4912.0 / 32760.0
-        return x * ut_per_lsb, y * ut_per_lsb, z * ut_per_lsb
+        data = i2c_read_bytes(self.bus, MPU_ADDR, REG_ACCEL_XOUT_H, 2)
+        ax_counts = be16_to_i16(data[0], data[1])
+        return (ax_counts / ACCEL_LSB_PER_G_2G) * G_MPS2
 
 
-def init_imus(bus: SMBus, mux: TCA9548A, enable_mag: bool) -> Dict[int, MPU9050]:
-    imus = {ch: MPU9050(bus, mux, ch, enable_mag=enable_mag) for ch in range(4)}
+def init_imus(bus: SMBus, mux: TCA9548A) -> Dict[int, MPU9050]:
+    imus = {ch: MPU9050(bus, mux, ch) for ch in range(4)}
     for ch, imu in imus.items():
         print(f"Init IMU{ch} on mux channel {ch}")
         imu.init_device()
