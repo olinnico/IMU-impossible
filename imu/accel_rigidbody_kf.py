@@ -12,7 +12,7 @@ import numpy as np
 import time
 import smbus
 
-from imusensor.MPU9250 import MPU9250
+from imusensor.MPU9250.MPU9250 import MPU9250
 from imusensor.filters import kalman
 
 # ============================
