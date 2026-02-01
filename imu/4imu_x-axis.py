@@ -11,19 +11,14 @@ Assumed hardware (based on repo context):
 
 Output:
 - Prints X-axis acceleration (m/s^2) for each IMU.
-- Optional +X/-X calibration saved to imu_x_calibration.json.
 
 Requirements:
 - pip3 install smbus2
 - I2C enabled on Raspberry Pi
 """
 
-import argparse
-import json
 import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 from smbus2 import SMBus, i2c_msg
 
@@ -36,14 +31,6 @@ REG_ACCEL_XOUT_H = 0x3B
 
 ACCEL_LSB_PER_G_2G = 16384.0
 G_MPS2 = 9.81
-
-CALIBRATION_PATH = Path(__file__).with_name("imu_x_calibration.json")
-
-
-@dataclass
-class XCalibration:
-    offset: float = 0.0
-    scale: float = 1.0
 
 
 def i2c_write_byte(bus: SMBus, addr: int, reg: int, val: int, retries: int = 3) -> None:
@@ -128,87 +115,7 @@ def read_all_x(imus: Dict[int, MPU9050]) -> Dict[int, float]:
     return values
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Read X-axis acceleration from four MPU9050 IMUs."
-    )
-    parser.add_argument(
-        "--calibrate-x",
-        action="store_true",
-        help="Run +X/-X calibration and save to imu_x_calibration.json.",
-    )
-    parser.add_argument(
-        "--samples",
-        type=int,
-        default=200,
-        help="Samples to average per calibration pose (default: 200).",
-    )
-    return parser.parse_args()
-
-
-def load_calibration() -> Dict[int, XCalibration]:
-    if not CALIBRATION_PATH.exists():
-        return {ch: XCalibration() for ch in range(4)}
-    data = json.loads(CALIBRATION_PATH.read_text())
-    cal = {}
-    for key, entry in data.items():
-        ch = int(key)
-        cal[ch] = XCalibration(
-            offset=float(entry.get("offset", 0.0)),
-            scale=float(entry.get("scale", 1.0)),
-        )
-    return cal
-
-
-def save_calibration(calibration: Dict[int, XCalibration]) -> None:
-    payload = {
-        str(ch): {"offset": cal.offset, "scale": cal.scale}
-        for ch, cal in calibration.items()
-    }
-    CALIBRATION_PATH.write_text(json.dumps(payload, indent=2))
-
-
-def average_samples(imus: Dict[int, MPU9050], samples: int) -> Dict[int, float]:
-    totals = {ch: 0.0 for ch in imus}
-    for _ in range(samples):
-        values = read_all_x(imus)
-        for ch, val in values.items():
-            totals[ch] += val
-        time.sleep(0.005)
-    return {ch: totals[ch] / samples for ch in totals}
-
-
-def calibrate_x(imus: Dict[int, MPU9050], samples: int) -> Dict[int, XCalibration]:
-    print("Calibration step 1: Place +X up for all IMUs, then press Enter.")
-    input()
-    plus = average_samples(imus, samples)
-
-    print("Calibration step 2: Place -X up for all IMUs, then press Enter.")
-    input()
-    minus = average_samples(imus, samples)
-
-    calibration = {}
-    for ch in sorted(imus):
-        offset = (plus[ch] + minus[ch]) / 2.0
-        scale = (2.0 * G_MPS2) / (plus[ch] - minus[ch])
-        calibration[ch] = XCalibration(offset=offset, scale=scale)
-        print(
-            f"IMU{ch}: +X={plus[ch]:+.3f} -X={minus[ch]:+.3f} "
-            f"-> offset={offset:+.3f} scale={scale:.5f}"
-        )
-    return calibration
-
-
-def apply_calibration(values: Dict[int, float], calibration: Dict[int, XCalibration]) -> Dict[int, float]:
-    corrected = {}
-    for ch, raw in values.items():
-        cal = calibration.get(ch, XCalibration())
-        corrected[ch] = (raw - cal.offset) * cal.scale
-    return corrected
-
-
 def main() -> None:
-    args = parse_args()
     print("=== MPU9050 X-AXIS ACCEL READ ===")
     with SMBus(1) as bus:
         mux = TCA9548A(bus, TCA_ADDR)
@@ -219,16 +126,9 @@ def main() -> None:
             raise SystemExit(f"Mux init failed at 0x{TCA_ADDR:02X}: {exc}")
 
         imus = init_imus(bus, mux)
-        calibration = load_calibration()
-        if args.calibrate_x:
-            calibration = calibrate_x(imus, args.samples)
-            save_calibration(calibration)
-            print(f"Saved calibration to {CALIBRATION_PATH}")
-            return
         while True:
             try:
                 values = read_all_x(imus)
-                values = apply_calibration(values, calibration)
             except Exception as exc:
                 print(f"Read error: {exc}")
                 time.sleep(0.05)
