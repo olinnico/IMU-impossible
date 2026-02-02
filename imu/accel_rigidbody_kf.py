@@ -762,7 +762,7 @@ def main():
             dt
         )
         
-  roll, pitch, yaw = sensorfusion.roll, sensorfusion.pitch, sensorfusion.yaw
+        roll, pitch, yaw = sensorfusion.roll, sensorfusion.pitch, sensorfusion.yaw
 
         # Convert degrees to radians (sensor fusion outputs degrees)
         roll_rad = np.deg2rad(roll)
