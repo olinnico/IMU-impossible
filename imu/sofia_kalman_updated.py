@@ -976,7 +976,7 @@ def main():
     
         
         # Remove gravity (check if you need np.deg2rad conversion)
-        accels_no_gravity = remove_gravity_from_accels(accels, roll, pitch, yaw)
+        accels_no_gravity = remove_gravity_from_accels(accels, roll_rad, pitch_rad, yaw_rad)
         
         # Angular velocity and acceleration
         omega_B = np.array([gx, gy, gz], dtype=float)
