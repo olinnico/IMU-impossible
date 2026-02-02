@@ -762,26 +762,39 @@ def main():
             dt
         )
         
-        roll, pitch, yaw = sensorfusion.roll, sensorfusion.pitch, sensorfusion.yaw
+  roll, pitch, yaw = sensorfusion.roll, sensorfusion.pitch, sensorfusion.yaw
+
+        # Convert degrees to radians (sensor fusion outputs degrees)
+        roll_rad = np.deg2rad(roll)
+        pitch_rad = np.deg2rad(pitch)
+        yaw_rad = np.deg2rad(yaw)
         
-        # Remove gravity from all accelerometer readings
-        accels_no_gravity = remove_gravity_from_accels(accels, roll, pitch, yaw)
-        
+        # ========== REMOVE GRAVITY ==========
+        accels_no_gravity = remove_gravity_from_accels(accels, roll_rad, pitch_rad, yaw_rad)
+        # ====================================
+
         # omega_B from CH0 gyro
         omega_B = np.array([gx, gy, gz], dtype=float)
         
         # Estimate angular acceleration
         alpha_B = alpha_est.update(omega_B)
-        
+
         # Update Q with actual dt
         Q = build_Q_random_walk(dt, sigma_a0_walk=sigma_a0_walk, sigma_b_walk=sigma_b_walk_mean)
         kf.Q = Q
-        
+
         # Kalman filter predict step
         kf.predict()
-        
+
         # Build corrected measurement and update (using gravity-free accels)
-        y, c = build_y_corrected(accels_no_gravity, omega_B, alpha_B)
+        y, c = build_y_corrected(accels_no_gravity, omega_B, alpha_B)  # ✅ FIXED
+        nu = kf.update(y)
+
+        # Extract estimated states
+        a0_B, biases_B = unpack_state(kf.x)
+
+        # Compute cleaned accelerations (gravity already removed)
+        accel_clean = accels_no_gravity - biases_B  # ✅ FIXED
         nu = kf.update(y)
         
         # Extract estimated states
@@ -791,9 +804,7 @@ def main():
         accel_clean = accels_no_gravity - biases_B
         
         # Print results
-        print(f"dt={dt:.3f} | R={roll:.2f} P={pitch:.2f} Y={yaw:.2f} | " +
-              f"a0={a0_B} | accel_clean[0]={accel_clean[0]}")
-        
+      print(f"R={roll:.2f} P={pitch:.2f} Y={yaw:.2f} | accel_clean[0]={accel_clean[0]}")
         time.sleep(0.01)
 
 
