@@ -804,7 +804,7 @@ def main():
         accel_clean = accels_no_gravity - biases_B
         
         # Print results
-      print(f"R={roll:.2f} P={pitch:.2f} Y={yaw:.2f} | accel_clean[0]={accel_clean[0]}")
+        print(f"R={roll:.2f} P={pitch:.2f} Y={yaw:.2f} | accel_clean[0]={accel_clean[0]}")
         time.sleep(0.01)
 
 
