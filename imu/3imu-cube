@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""
+imu_x_accel_3imu_cube.py
+
+Reads X-axis acceleration from three MPU9050 IMUs behind a TCA9548A I2C mux.
+
+Assumed hardware:
+- TCA9548A I2C multiplexer at 0x70
+- Three MPU9050 IMUs at address 0x68
+- IMUs connected to mux channels 0, 1, and 7
+
+Output:
+- Prints X-axis acceleration (m/s^2) for each IMU.
+- Optional +X/-X calibration saved to imu_x_calibration_3imu_cube.json.
+
+Requirements:
+- pip3 install smbus2
+- I2C enabled on Raspberry Pi
+"""
+
+import argparse
+import json
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict
+
+from smbus2 import SMBus, i2c_msg
+
+TCA_ADDR = 0x70
+MPU_ADDR = 0x68
+IMU_CHANNELS = (0, 1, 7)
+
+REG_PWR_MGMT_1 = 0x6B
+REG_ACCEL_CONFIG = 0x1C
+REG_ACCEL_XOUT_H = 0x3B
+
+ACCEL_LSB_PER_G_2G = 16384.0
+G_MPS2 = 9.81
+
+CALIBRATION_PATH = Path(__file__).with_name("imu_x_calibration_3imu_cube.json")
+
+
+@dataclass
+class XCalibration:
+    offset: float = 0.0
+    scale: float = 1.0
+
+
+def i2c_write_byte(bus: SMBus, addr: int, reg: int, val: int, retries: int = 3) -> None:
+    for _ in range(retries):
+        try:
+            bus.write_byte_data(addr, reg, val & 0xFF)
+            return
+        except Exception:
+            time.sleep(0.005)
+    raise IOError(f"I2C write failed addr=0x{addr:02X} reg=0x{reg:02X}")
+
+
+def i2c_read_bytes(bus: SMBus, addr: int, reg: int, n: int, retries: int = 3) -> bytes:
+    for _ in range(retries):
+        try:
+            write = i2c_msg.write(addr, [reg & 0xFF])
+            read = i2c_msg.read(addr, n)
+            bus.i2c_rdwr(write, read)
+            return bytes(read)
+        except Exception:
+            time.sleep(0.005)
+    raise IOError(f"I2C read failed addr=0x{addr:02X} reg=0x{reg:02X} n={n}")
+
+
+def be16_to_i16(b_hi: int, b_lo: int) -> int:
+    v = (b_hi << 8) | b_lo
+    return v - 65536 if v & 0x8000 else v
+
+
+class TCA9548A:
+    def __init__(self, bus: SMBus, addr: int = TCA_ADDR):
+        self.bus = bus
+        self.addr = addr
+        self.current = None
+
+    def select(self, ch: int) -> None:
+        if ch < 0 or ch > 7:
+            raise ValueError("TCA channel must be 0..7")
+        if self.current == ch:
+            return
+        self.bus.write_byte(self.addr, 1 << ch)
+        self.current = ch
+        time.sleep(0.001)
+
+
+class MPU9050:
+    def __init__(self, bus: SMBus, mux: TCA9548A, channel: int):
+        self.bus = bus
+        self.mux = mux
+        self.channel = channel
+        self.ready = False
+
+    def init_device(self) -> None:
+        self.mux.select(self.channel)
+        i2c_write_byte(self.bus, MPU_ADDR, REG_PWR_MGMT_1, 0x00)
+        time.sleep(0.05)
+        i2c_write_byte(self.bus, MPU_ADDR, REG_ACCEL_CONFIG, 0x00)
+        time.sleep(0.01)
+        self.ready = True
+
+    def read_accel_x_mps2(self) -> float:
+        if not self.ready:
+            raise RuntimeError("IMU not initialized")
+        self.mux.select(self.channel)
+        data = i2c_read_bytes(self.bus, MPU_ADDR, REG_ACCEL_XOUT_H, 2)
+        ax_counts = be16_to_i16(data[0], data[1])
+        return (ax_counts / ACCEL_LSB_PER_G_2G) * G_MPS2
+
+
+def init_imus(bus: SMBus, mux: TCA9548A) -> Dict[int, MPU9050]:
+    imus = {ch: MPU9050(bus, mux, ch) for ch in IMU_CHANNELS}
+    for ch, imu in imus.items():
+        print(f"Init IMU{ch} on mux channel {ch}")
+        imu.init_device()
+    return imus
+
+
+def read_all_x(imus: Dict[int, MPU9050]) -> Dict[int, float]:
+    return {ch: imu.read_accel_x_mps2() for ch, imu in imus.items()}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Read X-axis acceleration from three MPU9050 IMUs on channels 0, 1, and 7."
+    )
+    parser.add_argument(
+        "--calibrate-x",
+        action="store_true",
+        help="Run +X/-X calibration and save to imu_x_calibration_3imu_cube.json.",
+    )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=200,
+        help="Samples to average per calibration pose (default: 200).",
+    )
+    return parser.parse_args()
+
+
+def load_calibration() -> Dict[int, XCalibration]:
+    if not CALIBRATION_PATH.exists():
+        return {ch: XCalibration() for ch in IMU_CHANNELS}
+    data = json.loads(CALIBRATION_PATH.read_text())
+    cal = {}
+    for key, entry in data.items():
+        ch = int(key)
+        cal[ch] = XCalibration(
+            offset=float(entry.get("offset", 0.0)),
+            scale=float(entry.get("scale", 1.0)),
+        )
+    for ch in IMU_CHANNELS:
+        cal.setdefault(ch, XCalibration())
+    return cal
+
+
+def save_calibration(calibration: Dict[int, XCalibration]) -> None:
+    payload = {
+        str(ch): {"offset": cal.offset, "scale": cal.scale}
+        for ch, cal in calibration.items()
+    }
+    CALIBRATION_PATH.write_text(json.dumps(payload, indent=2))
+
+
+def average_samples(imus: Dict[int, MPU9050], samples: int) -> Dict[int, float]:
+    totals = {ch: 0.0 for ch in imus}
+    for _ in range(samples):
+        values = read_all_x(imus)
+        for ch, val in values.items():
+            totals[ch] += val
+        time.sleep(0.005)
+    return {ch: totals[ch] / samples for ch in totals}
+
+
+def calibrate_x(imus: Dict[int, MPU9050], samples: int) -> Dict[int, XCalibration]:
+    calibration = {}
+    for ch in sorted(imus):
+        print(f"Calibration for IMU{ch} on mux channel {ch}")
+        print("  Step 1: Place only this IMU with +X up, then press Enter.")
+        input()
+        plus = average_samples({ch: imus[ch]}, samples)[ch]
+
+        print("  Step 2: Place only this IMU with -X up, then press Enter.")
+        input()
+        minus = average_samples({ch: imus[ch]}, samples)[ch]
+
+        offset = (plus + minus) / 2.0
+        scale = (2.0 * G_MPS2) / (plus - minus)
+        calibration[ch] = XCalibration(offset=offset, scale=scale)
+        print(
+            f"IMU{ch}: +X={plus:+.3f} -X={minus:+.3f} "
+            f"-> offset={offset:+.3f} scale={scale:.5f}"
+        )
+    return calibration
+
+
+def apply_calibration(values: Dict[int, float], calibration: Dict[int, XCalibration]) -> Dict[int, float]:
+    corrected = {}
+    for ch, raw in values.items():
+        cal = calibration.get(ch, XCalibration())
+        corrected[ch] = (raw - cal.offset) * cal.scale
+    return corrected
+
+
+def main() -> None:
+    args = parse_args()
+    print("=== MPU9050 X-AXIS ACCEL READ (3IMU CUBE) ===")
+    with SMBus(1) as bus:
+        mux = TCA9548A(bus, TCA_ADDR)
+        try:
+            mux.select(IMU_CHANNELS[0])
+            print("Mux OK")
+        except Exception as exc:
+            raise SystemExit(f"Mux init failed at 0x{TCA_ADDR:02X}: {exc}")
+
+        imus = init_imus(bus, mux)
+        calibration = load_calibration()
+        if args.calibrate_x:
+            calibration = calibrate_x(imus, args.samples)
+            save_calibration(calibration)
+            print(f"Saved calibration to {CALIBRATION_PATH}")
+            return
+        while True:
+            try:
+                values = read_all_x(imus)
+                values = apply_calibration(values, calibration)
+            except Exception as exc:
+                print(f"Read error: {exc}")
+                time.sleep(0.05)
+                continue
+
+            line = "  ".join(
+                f"IMU{ch}: ax={values[ch]:+7.3f} m/s^2" for ch in sorted(values)
+            )
+            print(line)
+            time.sleep(0.05)
+
+
+if __name__ == "__main__":
+    main()
