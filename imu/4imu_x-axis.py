@@ -21,9 +21,10 @@ Requirements:
 import argparse
 import json
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict
+from typing import Deque, Dict
 
 from smbus2 import SMBus, i2c_msg
 
@@ -44,6 +45,20 @@ CALIBRATION_PATH = Path(__file__).with_name("imu_x_calibration.json")
 class XCalibration:
     offset: float = 0.0
     scale: float = 1.0
+
+
+@dataclass
+class Kalman1D:
+    x: float = 0.0
+    P: float = 1.0
+    Q: float = 0.01
+
+    def update(self, z: float, R: float) -> float:
+        self.P += self.Q
+        K = self.P / (self.P + R)
+        self.x = self.x + K * (z - self.x)
+        self.P = (1.0 - K) * self.P
+        return self.x
 
 
 def i2c_write_byte(bus: SMBus, addr: int, reg: int, val: int, retries: int = 3) -> None:
@@ -143,6 +158,18 @@ def parse_args() -> argparse.Namespace:
         default=200,
         help="Samples to average per calibration pose (default: 200).",
     )
+    parser.add_argument(
+        "--kalman-window",
+        type=int,
+        default=20,
+        help="Samples in sliding window for measurement variance (default: 20).",
+    )
+    parser.add_argument(
+        "--kalman-q",
+        type=float,
+        default=0.01,
+        help="Kalman process noise (default: 0.01).",
+    )
     return parser.parse_args()
 
 
@@ -207,6 +234,13 @@ def apply_calibration(values: Dict[int, float], calibration: Dict[int, XCalibrat
     return corrected
 
 
+def variance(samples: Deque[float]) -> float:
+    if len(samples) < 2:
+        return 1e-3
+    mean = sum(samples) / len(samples)
+    return max(sum((x - mean) ** 2 for x in samples) / (len(samples) - 1), 1e-6)
+
+
 def main() -> None:
     args = parse_args()
     print("=== MPU9050 X-AXIS ACCEL READ ===")
@@ -225,6 +259,12 @@ def main() -> None:
             save_calibration(calibration)
             print(f"Saved calibration to {CALIBRATION_PATH}")
             return
+        filters = {
+            ch: Kalman1D(x=0.0, P=1.0, Q=args.kalman_q) for ch in imus
+        }
+        windows = {
+            ch: deque(maxlen=max(args.kalman_window, 1)) for ch in imus
+        }
         while True:
             try:
                 values = read_all_x(imus)
@@ -234,8 +274,15 @@ def main() -> None:
                 time.sleep(0.05)
                 continue
 
+            filtered = {}
+            for ch, val in values.items():
+                window = windows[ch]
+                window.append(val)
+                R = variance(window)
+                filtered[ch] = filters[ch].update(val, R)
+
             line = "  ".join(
-                f"IMU{ch}: ax={values[ch]:+7.3f} m/s^2" for ch in sorted(values)
+                f"IMU{ch}: ax={filtered[ch]:+7.3f} m/s^2" for ch in sorted(filtered)
             )
             print(line)
             time.sleep(0.05)
