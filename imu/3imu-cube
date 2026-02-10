@@ -42,6 +42,13 @@ G_MPS2 = 9.81
 CALIBRATION_PATH = Path(__file__).with_name("imu_xyz_calibration_3imu_cube.json")
 
 
+CHANNEL_AXIS_MAP = {
+    7: {"x": ("z", 1.0), "y": ("y", 1.0), "z": ("x", -1.0)},
+    0: {"x": ("y", -1.0), "y": ("x", 1.0), "z": ("z", 1.0)},
+    1: {"x": ("y", -1.0), "y": ("z", 1.0), "z": ("x", -1.0)},
+}
+
+
 @dataclass
 class AxisCalibration:
     offset: float = 0.0
@@ -235,6 +242,21 @@ def calibrate_xyz(imus: Dict[int, MPU9050], samples: int) -> Dict[int, Dict[str,
     return calibration
 
 
+
+
+def map_to_cube_axes(values: Dict[int, Dict[str, float]]) -> Dict[int, Dict[str, float]]:
+    mapped: Dict[int, Dict[str, float]] = {}
+    for ch, axes in values.items():
+        axis_map = CHANNEL_AXIS_MAP.get(ch)
+        if axis_map is None:
+            mapped[ch] = dict(axes)
+            continue
+        mapped[ch] = {
+            axis: axes[src_axis] * sign
+            for axis, (src_axis, sign) in axis_map.items()
+        }
+    return mapped
+
 def apply_calibration(
     values: Dict[int, Dict[str, float]],
     calibration: Dict[int, Dict[str, AxisCalibration]],
@@ -271,6 +293,7 @@ def main() -> None:
             try:
                 values = read_all_xyz(imus)
                 values = apply_calibration(values, calibration)
+                values = map_to_cube_axes(values)
             except Exception as exc:
                 print(f"Read error: {exc}")
                 time.sleep(0.05)
