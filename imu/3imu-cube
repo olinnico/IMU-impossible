@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-imu_x_accel_3imu_cube.py
+imu_xyz_accel_3imu_cube.py
 
-Reads X-axis acceleration from three MPU9050 IMUs behind a TCA9548A I2C mux.
+Reads XYZ acceleration from three MPU9050 IMUs behind a TCA9548A I2C mux.
 
 Assumed hardware:
 - TCA9548A I2C multiplexer at 0x70
@@ -10,8 +10,8 @@ Assumed hardware:
 - IMUs connected to mux channels 0, 1, and 7
 
 Output:
-- Prints X-axis acceleration (m/s^2) for each IMU.
-- Optional +X/-X calibration saved to imu_x_calibration_3imu_cube.json.
+- Prints X/Y/Z acceleration for each IMU.
+- Optional per-IMU, per-axis (+/-) calibration saved to imu_xyz_calibration_3imu_cube.json.
 
 Requirements:
 - pip3 install smbus2
@@ -30,6 +30,7 @@ from smbus2 import SMBus, i2c_msg
 TCA_ADDR = 0x70
 MPU_ADDR = 0x68
 IMU_CHANNELS = (0, 1, 7)
+AXES = ("x", "y", "z")
 
 REG_PWR_MGMT_1 = 0x6B
 REG_ACCEL_CONFIG = 0x1C
@@ -38,11 +39,11 @@ REG_ACCEL_XOUT_H = 0x3B
 ACCEL_LSB_PER_G_2G = 16384.0
 G_MPS2 = 9.81
 
-CALIBRATION_PATH = Path(__file__).with_name("imu_x_calibration_3imu_cube.json")
+CALIBRATION_PATH = Path(__file__).with_name("imu_xyz_calibration_3imu_cube.json")
 
 
 @dataclass
-class XCalibration:
+class AxisCalibration:
     offset: float = 0.0
     scale: float = 1.0
 
@@ -105,13 +106,19 @@ class MPU9050:
         time.sleep(0.01)
         self.ready = True
 
-    def read_accel_x_mps2(self) -> float:
+    def read_accel_xyz_mps2(self) -> Dict[str, float]:
         if not self.ready:
             raise RuntimeError("IMU not initialized")
         self.mux.select(self.channel)
-        data = i2c_read_bytes(self.bus, MPU_ADDR, REG_ACCEL_XOUT_H, 2)
+        data = i2c_read_bytes(self.bus, MPU_ADDR, REG_ACCEL_XOUT_H, 6)
         ax_counts = be16_to_i16(data[0], data[1])
-        return (ax_counts / ACCEL_LSB_PER_G_2G) * G_MPS2
+        ay_counts = be16_to_i16(data[2], data[3])
+        az_counts = be16_to_i16(data[4], data[5])
+        return {
+            "x": (ax_counts / ACCEL_LSB_PER_G_2G) * G_MPS2,
+            "y": (ay_counts / ACCEL_LSB_PER_G_2G) * G_MPS2,
+            "z": (az_counts / ACCEL_LSB_PER_G_2G) * G_MPS2,
+        }
 
 
 def init_imus(bus: SMBus, mux: TCA9548A) -> Dict[int, MPU9050]:
@@ -122,18 +129,18 @@ def init_imus(bus: SMBus, mux: TCA9548A) -> Dict[int, MPU9050]:
     return imus
 
 
-def read_all_x(imus: Dict[int, MPU9050]) -> Dict[int, float]:
-    return {ch: imu.read_accel_x_mps2() for ch, imu in imus.items()}
+def read_all_xyz(imus: Dict[int, MPU9050]) -> Dict[int, Dict[str, float]]:
+    return {ch: imu.read_accel_xyz_mps2() for ch, imu in imus.items()}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Read X-axis acceleration from three MPU9050 IMUs on channels 0, 1, and 7."
+        description="Read XYZ acceleration from three MPU9050 IMUs on channels 0, 1, and 7."
     )
     parser.add_argument(
-        "--calibrate-x",
+        "--calibrate",
         action="store_true",
-        help="Run +X/-X calibration and save to imu_x_calibration_3imu_cube.json.",
+        help="Run per-IMU, per-axis (+/-) calibration and save to imu_xyz_calibration_3imu_cube.json.",
     )
     parser.add_argument(
         "--samples",
@@ -144,80 +151,106 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_calibration() -> Dict[int, XCalibration]:
+def default_calibration() -> Dict[int, Dict[str, AxisCalibration]]:
+    return {ch: {axis: AxisCalibration() for axis in AXES} for ch in IMU_CHANNELS}
+
+
+def load_calibration() -> Dict[int, Dict[str, AxisCalibration]]:
     if not CALIBRATION_PATH.exists():
-        return {ch: XCalibration() for ch in IMU_CHANNELS}
+        return default_calibration()
+
     data = json.loads(CALIBRATION_PATH.read_text())
-    cal = {}
-    for key, entry in data.items():
-        ch = int(key)
-        cal[ch] = XCalibration(
-            offset=float(entry.get("offset", 0.0)),
-            scale=float(entry.get("scale", 1.0)),
-        )
-    for ch in IMU_CHANNELS:
-        cal.setdefault(ch, XCalibration())
-    return cal
+    calibration = default_calibration()
+    for ch_key, axis_map in data.items():
+        ch = int(ch_key)
+        if ch not in calibration:
+            continue
+        for axis in AXES:
+            entry = axis_map.get(axis, {})
+            calibration[ch][axis] = AxisCalibration(
+                offset=float(entry.get("offset", 0.0)),
+                scale=float(entry.get("scale", 1.0)),
+            )
+    return calibration
 
 
-def save_calibration(calibration: Dict[int, XCalibration]) -> None:
+def save_calibration(calibration: Dict[int, Dict[str, AxisCalibration]]) -> None:
     payload = {
-        str(ch): {"offset": cal.offset, "scale": cal.scale}
-        for ch, cal in calibration.items()
+        str(ch): {
+            axis: {
+                "offset": calibration[ch][axis].offset,
+                "scale": calibration[ch][axis].scale,
+            }
+            for axis in AXES
+        }
+        for ch in sorted(calibration)
     }
     CALIBRATION_PATH.write_text(json.dumps(payload, indent=2))
 
 
-def average_samples(imus: Dict[int, MPU9050], samples: int) -> Dict[int, float]:
-    totals = {ch: 0.0 for ch in imus}
+def average_samples(imus: Dict[int, MPU9050], samples: int) -> Dict[int, Dict[str, float]]:
+    totals = {ch: {axis: 0.0 for axis in AXES} for ch in imus}
     for _ in range(samples):
-        values = read_all_x(imus)
-        for ch, val in values.items():
-            totals[ch] += val
+        values = read_all_xyz(imus)
+        for ch, axes in values.items():
+            for axis, val in axes.items():
+                totals[ch][axis] += val
         time.sleep(0.005)
-    return {ch: totals[ch] / samples for ch in totals}
+    return {
+        ch: {axis: totals[ch][axis] / samples for axis in AXES}
+        for ch in totals
+    }
 
 
-def calibrate_x(imus: Dict[int, MPU9050], samples: int) -> Dict[int, XCalibration]:
-    calibration = {}
+def calibrate_xyz(imus: Dict[int, MPU9050], samples: int) -> Dict[int, Dict[str, AxisCalibration]]:
+    calibration = default_calibration()
+
     for ch in sorted(imus):
         print(f"Calibration for IMU{ch}")
-        print(f"  Step 1/2: Place IMU{ch} with +X up, then press Enter.")
-        input()
-        plus = average_samples({ch: imus[ch]}, samples)[ch]
+        for axis in AXES:
+            axis_upper = axis.upper()
+            print(f"  {axis_upper}-axis step 1/2: Place IMU{ch} with +{axis_upper} up, then press Enter.")
+            input()
+            plus = average_samples({ch: imus[ch]}, samples)[ch][axis]
 
-        print(f"  Step 2/2: Place IMU{ch} with -X up, then press Enter.")
-        input()
-        minus = average_samples({ch: imus[ch]}, samples)[ch]
+            print(f"  {axis_upper}-axis step 2/2: Place IMU{ch} with -{axis_upper} up, then press Enter.")
+            input()
+            minus = average_samples({ch: imus[ch]}, samples)[ch][axis]
 
-        if abs(plus - minus) < 1e-6:
-            raise RuntimeError(
-                f"IMU{ch} calibration failed: +X and -X readings are too close. "
-                "Check orientation and wiring, then retry."
+            if abs(plus - minus) < 1e-6:
+                raise RuntimeError(
+                    f"IMU{ch} {axis_upper}-axis calibration failed: + and - readings are too close. "
+                    "Check orientation and wiring, then retry."
+                )
+
+            offset = (plus + minus) / 2.0
+            scale = (2.0 * G_MPS2) / (plus - minus)
+            calibration[ch][axis] = AxisCalibration(offset=offset, scale=scale)
+            print(
+                f"    {axis_upper}: +={plus:+.3f} -={minus:+.3f} "
+                f"-> offset={offset:+.3f} scale={scale:.5f}"
             )
-
-        offset = (plus + minus) / 2.0
-        scale = (2.0 * G_MPS2) / (plus - minus)
-        calibration[ch] = XCalibration(offset=offset, scale=scale)
-        print(
-            f"IMU{ch}: +X={plus:+.3f} -X={minus:+.3f} "
-            f"-> offset={offset:+.3f} scale={scale:.5f}"
-        )
         print()
+
     return calibration
 
 
-def apply_calibration(values: Dict[int, float], calibration: Dict[int, XCalibration]) -> Dict[int, float]:
-    corrected = {}
-    for ch, raw in values.items():
-        cal = calibration.get(ch, XCalibration())
-        corrected[ch] = (raw - cal.offset) * cal.scale
+def apply_calibration(
+    values: Dict[int, Dict[str, float]],
+    calibration: Dict[int, Dict[str, AxisCalibration]],
+) -> Dict[int, Dict[str, float]]:
+    corrected: Dict[int, Dict[str, float]] = {}
+    for ch, axes in values.items():
+        corrected[ch] = {}
+        for axis, raw in axes.items():
+            cal = calibration.get(ch, {}).get(axis, AxisCalibration())
+            corrected[ch][axis] = (raw - cal.offset) * cal.scale
     return corrected
 
 
 def main() -> None:
     args = parse_args()
-    print("=== MPU9050 X-AXIS ACCEL READ (3IMU CUBE) ===")
+    print("=== MPU9050 XYZ ACCEL READ (3IMU CUBE) ===")
     with SMBus(1) as bus:
         mux = TCA9548A(bus, TCA_ADDR)
         try:
@@ -228,14 +261,15 @@ def main() -> None:
 
         imus = init_imus(bus, mux)
         calibration = load_calibration()
-        if args.calibrate_x:
-            calibration = calibrate_x(imus, args.samples)
+        if args.calibrate:
+            calibration = calibrate_xyz(imus, args.samples)
             save_calibration(calibration)
             print(f"Saved calibration to {CALIBRATION_PATH}")
             return
+
         while True:
             try:
-                values = read_all_x(imus)
+                values = read_all_xyz(imus)
                 values = apply_calibration(values, calibration)
             except Exception as exc:
                 print(f"Read error: {exc}")
@@ -243,7 +277,13 @@ def main() -> None:
                 continue
 
             line = "  ".join(
-                f"IMU{ch}: ax={values[ch]:+7.3f} m/s^2" for ch in sorted(values)
+                (
+                    f"IMU{ch}: "
+                    f"x={values[ch]['x']:+.1f} "
+                    f"y={values[ch]['y']:+.1f} "
+                    f"z={values[ch]['z']:+.1f}"
+                )
+                for ch in sorted(values)
             )
             print(line)
             time.sleep(0.05)
