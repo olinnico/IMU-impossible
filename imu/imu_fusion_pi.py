@@ -28,12 +28,24 @@ Enable I2C on Pi:
 
 Run:
 - python3 imu_fusion_pi.py
+
+Anchor / Grid calibration mode (optional):
+- Enable in Config with anchor_mode_enable = True.
+- Commands via stdin while running:
+    "a x y" or "a x y z" -> set anchor in grid units
+    "zero"              -> anchor at (0,0,0)
+    "print"             -> print current p, v, and last anchor
+- Anchors only apply after the rig is stationary for anchor_stationary_hold_s.
+- If anchor_prompt_calibration is True, press Enter to start calibration.
 """
 
 import time
 import math
+import sys
+import threading
+import queue
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 
 import numpy as np
 from smbus2 import SMBus, i2c_msg
@@ -392,12 +404,6 @@ class Config:
     res_warn: float = 0.8
     res_hard: float = 1.6
 
-    # Confidence update parameters
-    sat_guard: float = 0.90
-    pen_soft: float = 0.97
-    pen_hard: float = 0.90
-    recover: float = 1.002
-
     # Placeholder mag calibration
     mag_offset_uT: np.ndarray = field(default_factory=lambda: np.zeros(3))
     mag_scale: np.ndarray = field(default_factory=lambda:np.ones(3))
@@ -406,10 +412,25 @@ class Config:
     zupt_enable: bool = True
     zupt_gyro: float = 0.06      # rad/s (stricter than before)
     zupt_acc_mag: float = 0.20   # m/s^2 difference from g (stricter)
+    zupt_min_frames: int = 8     # frames required to enter "stationary"
+    zupt_release_frames: int = 3 # frames required to exit "stationary"
 
     # Bias learning when stationary
     bias_learn_enable: bool = True
     bias_learn_rate: float = 0.05
+
+    # Velocity damping (reduces drift when slightly moving)
+    vel_damping: float = 0.25    # 1/s, exponential decay of velocity
+
+    # Anchor / grid calibration mode
+    anchor_mode_enable: bool = False
+    anchor_prompt_calibration: bool = True
+    anchor_units_in_meters: float = 0.01
+    anchor_stationary_hold_s: float = 1.0
+    anchor_pos_gain: float = 1.0
+    anchor_bias_tune_enable: bool = False
+    anchor_bias_gain: float = 0.02
+    anchor_bias_max: float = 0.30
 
     # dt clamps
     dt_min: float = 0.002
@@ -424,6 +445,92 @@ cfg = Config(
         3: np.array([0.000, 0.000, 0.000], dtype=float),
     }
 )
+
+MAIN_IMU = 3
+
+
+class AnchorInput:
+    """
+    Background stdin reader to avoid blocking the main loop.
+    """
+    def __init__(self):
+        self.queue: "queue.Queue" = queue.Queue()
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+
+    def _reader(self) -> None:
+        for line in sys.stdin:
+            self.queue.put(line.strip())
+
+    def poll(self) -> Optional[str]:
+        try:
+            return self.queue.get_nowait()
+        except queue.Empty:
+            return None
+
+
+class AnchorManager:
+    """
+    Handle anchor commands and apply position corrections when stationary.
+    """
+    def __init__(self):
+        self.pending_anchor_m: Optional[np.ndarray] = None
+        self.last_anchor_m: Optional[np.ndarray] = None
+        self.last_delta_m: Optional[np.ndarray] = None
+        self.last_applied: bool = False
+        self.print_requested: bool = False
+
+    def _parse_anchor(self, parts: List[str]) -> Optional[np.ndarray]:
+        if len(parts) not in (3, 4):
+            return None
+        try:
+            coords = [float(p) for p in parts[1:]]
+        except ValueError:
+            return None
+        if len(coords) == 2:
+            coords.append(0.0)
+        return np.array(coords, dtype=float) * cfg.anchor_units_in_meters
+
+    def handle_command(self, cmd: str) -> None:
+        parts = cmd.strip().split()
+        if not parts:
+            return
+        key = parts[0].lower()
+        if key == "a":
+            anchor = self._parse_anchor(parts)
+            if anchor is not None:
+                self.pending_anchor_m = anchor
+                print(f"[ANCHOR] pending set to {anchor}")
+            else:
+                print("[ANCHOR] invalid format. Use: a x y [z]")
+        elif key == "zero":
+            self.pending_anchor_m = np.zeros(3, dtype=float)
+            print("[ANCHOR] pending set to [0,0,0]")
+        elif key == "print":
+            self.print_requested = True
+        else:
+            print(f"[ANCHOR] unknown command: {cmd}")
+
+    def apply_if_ready(self, integ: "Integrator", stationary: bool, stationary_time: float) -> None:
+        self.last_applied = False
+        if self.pending_anchor_m is None:
+            return
+        if not (stationary and stationary_time >= cfg.anchor_stationary_hold_s):
+            return
+        desired = self.pending_anchor_m
+        current = integ.p.copy()
+        delta = desired - current
+        gain = clamp(cfg.anchor_pos_gain, 0.0, 1.0)
+        integ.p = current + gain * delta
+        integ.v[:] = 0.0
+        self.last_anchor_m = integ.p.copy()
+        self.last_delta_m = delta
+        self.last_applied = True
+        self.pending_anchor_m = None
+        if cfg.anchor_bias_tune_enable:
+            bias_adjust = -cfg.anchor_bias_gain * delta
+            integ.b_aw += np.clip(bias_adjust, -cfg.anchor_bias_max, cfg.anchor_bias_max)
+        print(f"[ANCHOR] applied, delta={delta}, new p={integ.p}")
 
 
 class BiasCal4:
@@ -472,106 +579,67 @@ class BiasCal4:
 
 class Fusion:
     """
-    Confidence-weighted fusion + rigid-body least squares fit.
-
-    Goal: use 4 accelerometers placed at different positions to estimate:
-    - a0: translational acceleration at the reference point (body frame)
-    - alpha: angular acceleration
-    while accounting for centripetal term omega x (omega x r)
+    Use one "main" IMU as the primary source, and use the others to
+    validate rigid-body consistency (estimate alpha + residuals).
     """
-    def __init__(self):
-        self.conf = {i: 1.0 for i in cfg.pos}
+    @staticmethod
+    def _relative_positions(main_idx: int) -> Dict[int, np.ndarray]:
+        origin = cfg.pos[main_idx]
+        return {i: (cfg.pos[i] - origin) for i in cfg.pos}
 
-    def apply_saturation_penalty(self, acc: Dict[int, np.ndarray], accel_fs_g: Dict[int, float]) -> None:
+    def fuse_omega(self, gyr: Dict[int, np.ndarray], main_idx: int) -> np.ndarray:
         """
-        If accel magnitude approaches its full-scale, reduce its confidence.
+        Use the main IMU gyro directly.
         """
-        for i in cfg.pos:
-            fs = accel_fs_g[i] * cfg.g
-            if safe_norm(acc[i]) > cfg.sat_guard * fs:
-                self.conf[i] *= 0.90
+        return gyr[main_idx]
 
-    def fuse_omega(self, gyr: Dict[int, np.ndarray]) -> np.ndarray:
+    def estimate_alpha(self, acc: Dict[int, np.ndarray], omega: np.ndarray, main_idx: int) -> np.ndarray:
         """
-        Weighted average of gyros into one omega estimate.
+        Estimate angular acceleration using the non-main IMUs:
+
+            acc_i - acc_main - omega x (omega x r_i) = alpha x r_i
         """
-        ids = [0, 1, 2, 3]
-        w = np.array([self.conf[i] for i in ids], dtype=float)
-        ws = float(np.sum(w)) if float(np.sum(w)) > 1e-9 else 1.0
-        omega = np.zeros(3, dtype=float)
-        for idx, i in enumerate(ids):
-            omega += (w[idx] / ws) * gyr[i]
-        return omega
-
-    def rigid_body_fit(self, acc: Dict[int, np.ndarray], omega: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Solve for a0 and alpha in:
-
-            acc_i = a0 + alpha x r_i + omega x (omega x r_i)
-
-        Rearrange:
-
-            acc_i - omega x (omega x r_i) = a0 + alpha x r_i
-
-        alpha x r_i = -skew(r_i) alpha
-
-        So linear system:
-            y = [I  -skew(r)] [a0; alpha]
-        """
+        rel = self._relative_positions(main_idx)
         A, y = [], []
-        for i in [0, 1, 2, 3]:
-            r = cfg.pos[i]
+        for i in cfg.pos:
+            if i == main_idx:
+                continue
+            r = rel[i]
             c = centripetal_term(omega, r)
-            yi = acc[i] - c
-            Ai = np.hstack([np.eye(3), -skew(r)])
+            yi = acc[i] - acc[main_idx] - c
+            Ai = -skew(r)
             A.append(Ai)
             y.append(yi.reshape(3, 1))
 
+        if not A:
+            return np.zeros(3, dtype=float)
+
         A = np.vstack(A)
         y = np.vstack(y).ravel()
-
-        x = np.linalg.lstsq(A, y, rcond=None)[0]
-        a0 = x[0:3]
-        alpha = x[3:6]
-        return a0, alpha
+        alpha = np.linalg.lstsq(A, y, rcond=None)[0]
+        return alpha
 
     def residual_norms(self, acc: Dict[int, np.ndarray], omega: np.ndarray,
-                       a0: np.ndarray, alpha: np.ndarray) -> Dict[int, float]:
+                       a0: np.ndarray, alpha: np.ndarray, main_idx: int) -> Dict[int, float]:
         """
         Compute per-IMU residual error for consistency scoring.
         """
+        rel = self._relative_positions(main_idx)
         norms = {}
-        for i in [0, 1, 2, 3]:
-            r = cfg.pos[i]
+        for i in cfg.pos:
+            if i == main_idx:
+                norms[i] = 0.0
+                continue
+            r = rel[i]
             pred = a0 + np.cross(alpha, r) + centripetal_term(omega, r)
             norms[i] = float(np.linalg.norm(acc[i] - pred))
         return norms
 
-    def update_conf(self, norms: Dict[int, float]) -> None:
+    def fuse_mag(self, mag: Dict[int, np.ndarray], main_idx: int) -> np.ndarray:
         """
-        Reduce confidence for sensors with large residuals, recover slowly otherwise.
+        Use the main IMU magnetometer directly.
         """
-        for i, e in norms.items():
-            if e > cfg.res_hard:
-                self.conf[i] *= cfg.pen_hard
-            elif e > cfg.res_warn:
-                self.conf[i] *= cfg.pen_soft
-            else:
-                self.conf[i] = min(1.0, self.conf[i] * cfg.recover)
-            self.conf[i] = clamp(self.conf[i], 0.05, 1.0)
-
-    def fuse_mag(self, mag: Dict[int, np.ndarray]) -> np.ndarray:
-        """
-        Weighted average magnetometer (only channels with mag).
-        """
-        ids = [0, 1, 3]
-        w = np.array([self.conf[i] for i in ids], dtype=float)
-        ws = float(np.sum(w)) if float(np.sum(w)) > 1e-9 else 1.0
-        w = w / ws
-        m = np.zeros(3, dtype=float)
-        for idx, i in enumerate(ids):
-            m += w[idx] * mag[i]
-        return m
+        return mag[main_idx]
 
 
 class Integrator:
@@ -588,12 +656,18 @@ class Integrator:
         self.p = np.zeros(3, dtype=float)
         self.b_aw = np.zeros(3, dtype=float)
         self.a_prev = np.zeros(3, dtype=float)
+        self.stationary = False
+        self.stationary_count = 0
+        self.moving_count = 0
 
     def reset(self) -> None:
         self.v[:] = 0.0
         self.p[:] = 0.0
         self.b_aw[:] = 0.0
         self.a_prev[:] = 0.0
+        self.stationary = False
+        self.stationary_count = 0
+        self.moving_count = 0
 
     def zupt(self, a_body: np.ndarray, omega: np.ndarray, residual_ok: bool) -> bool:
         """
@@ -602,6 +676,7 @@ class Integrator:
         - accel magnitude close to g
         - rigid-body residuals ok
 
+        Uses a small hysteresis window so "still" doesn't flicker.
         If stationary, we clamp v=0.
         """
         if not cfg.zupt_enable:
@@ -611,9 +686,20 @@ class Integrator:
                 abs(safe_norm(a_body) - cfg.g) < cfg.zupt_acc_mag and
                 residual_ok)
         if cond:
+            self.stationary_count += 1
+            self.moving_count = 0
+        else:
+            self.moving_count += 1
+            self.stationary_count = 0
+
+        if not self.stationary and self.stationary_count >= cfg.zupt_min_frames:
+            self.stationary = True
+        elif self.stationary and self.moving_count >= cfg.zupt_release_frames:
+            self.stationary = False
+
+        if self.stationary:
             self.v[:] = 0.0
-            return True
-        return False
+        return self.stationary
 
     def step(self, a_body: np.ndarray, Rwb: np.ndarray, dt: float, stationary: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -640,6 +726,8 @@ class Integrator:
 
         if not stationary:
             self.v += 0.5 * (self.a_prev + a_lin) * dt
+            if cfg.vel_damping > 0.0:
+                self.v *= math.exp(-cfg.vel_damping * dt)
 
         self.p += self.v * dt
         self.a_prev = a_lin
@@ -656,10 +744,6 @@ def main() -> None:
     # Open I2C bus 1 (typical on Raspberry Pi)
     with SMBus(1) as bus:
         mux = TCA9548A(bus, TCA_ADDR)
-
-        # Describe your sensor set
-        # accel_fs_g used only for saturation confidence (match your ranges)
-        accel_fs_g = {0: 16.0, 1: 16.0, 2: 2.0, 3: 16.0}
 
         # Create the 4 IMU objects
         imus = {
@@ -690,12 +774,22 @@ def main() -> None:
         fuse = Fusion()
         ahrs = MahonyAHRS(kp=2.5, ki=0.05)
         integ = Integrator()
+        if cfg.anchor_mode_enable and cfg.anchor_prompt_calibration:
+            print("Anchor mode enabled. Press Enter to start calibration...")
+            try:
+                input()
+            except EOFError:
+                pass
+
+        anchor_input = AnchorInput() if cfg.anchor_mode_enable else None
+        anchor_mgr = AnchorManager() if cfg.anchor_mode_enable else None
 
         print(f"Collecting {cfg.cal_frames} stationary frames for bias... keep still")
 
         # Timing
         t_prev = time.perf_counter()
         frame = 0
+        stationary_time = 0.0
 
         # Main loop
         while True:
@@ -739,16 +833,14 @@ def main() -> None:
             # Bias-corrected sensor values
             acc, gyr, mag = cal.correct(acc_raw, gyr_raw, mag_raw)
 
-            # Confidence + rigid-body fit
-            fuse.apply_saturation_penalty(acc, accel_fs_g)
-            omega = fuse.fuse_omega(gyr)
+            # Main IMU provides primary motion; others validate consistency
+            omega = fuse.fuse_omega(gyr, MAIN_IMU)
+            a0_body = acc[MAIN_IMU]
+            alpha = fuse.estimate_alpha(acc, omega, MAIN_IMU)
+            norms = fuse.residual_norms(acc, omega, a0_body, alpha, MAIN_IMU)
 
-            a0_body, alpha = fuse.rigid_body_fit(acc, omega)
-            norms = fuse.residual_norms(acc, omega, a0_body, alpha)
-            fuse.update_conf(norms)
-
-            # Mag fusion (optional yaw correction)
-            m_fused = fuse.fuse_mag(mag)
+            # Mag from main IMU (optional yaw correction)
+            m_fused = fuse.fuse_mag(mag, MAIN_IMU)
             use_mag = safe_norm(m_fused) > 1e-3
 
             # Attitude update uses a0_body (translation accel estimate)
@@ -758,19 +850,46 @@ def main() -> None:
             # Stationary decision for ZUPT
             residual_ok = (max(norms.values()) < cfg.res_warn)
             stationary = integ.zupt(a0_body, omega, residual_ok)
+            stationary_time = (stationary_time + dt) if stationary else 0.0
+
+            if cfg.anchor_mode_enable and anchor_input and anchor_mgr:
+                while True:
+                    cmd = anchor_input.poll()
+                    if cmd is None:
+                        break
+                    anchor_mgr.handle_command(cmd)
+                anchor_mgr.apply_if_ready(integ, stationary, stationary_time)
 
             # Integrate
             p, v, a_lin_w = integ.step(a0_body, Rwb, dt, stationary=stationary)
 
             # Minimal print (every 10 frames)
             if frame % 10 == 0:
-                # Report only what you said you care about:
-                # world-frame linear accel, velocity, position, plus "still" and dt
+                if cfg.anchor_mode_enable and anchor_mgr:
+                    anchor = anchor_mgr.last_anchor_m
+                    anchor_str = "None" if anchor is None else f"[{anchor[0]:+7.3f},{anchor[1]:+7.3f},{anchor[2]:+7.3f}]"
+                    print(
+                        f"p [{p[0]:+7.3f},{p[1]:+7.3f},{p[2]:+7.3f}]  "
+                        f"anchor {anchor_str}  still={stationary}  "
+                        f"applied={anchor_mgr.last_applied}  dt={dt*1000:5.1f}ms"
+                    )
+                else:
+                    # Report only what you said you care about:
+                    # world-frame linear accel, velocity, position, plus "still" and dt
+                    print(
+                        # f"a_xy [{a_lin_w[0]:+7.3f},{a_lin_w[1]:+7.3f}]  "
+                        # f"v_xy [{v[0]:+7.3f},{v[1]:+7.3f}]  "
+                        f"p_xy [{p[0]:+7.3f},{p[1]:+7.3f}]  "
+                        f"still={stationary}  dt={dt*1000:5.1f}ms"
+                    )
+
+            if cfg.anchor_mode_enable and anchor_mgr and anchor_mgr.print_requested:
+                anchor_mgr.print_requested = False
+                anchor = anchor_mgr.last_anchor_m
+                anchor_str = "None" if anchor is None else f"[{anchor[0]:+7.3f},{anchor[1]:+7.3f},{anchor[2]:+7.3f}]"
                 print(
-                    # f"a_xy [{a_lin_w[0]:+7.3f},{a_lin_w[1]:+7.3f}]  "
-                    # f"v_xy [{v[0]:+7.3f},{v[1]:+7.3f}]  "
-                    f"p_xy [{p[0]:+7.3f},{p[1]:+7.3f}]  "
-                    f"still={stationary}  dt={dt*1000:5.1f}ms"
+                    f"[ANCHOR] p={p} v={v} anchor={anchor_str} still={stationary} "
+                    f"stationary_s={stationary_time:.2f}"
                 )
 
             time.sleep(0.005)
