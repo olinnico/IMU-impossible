@@ -406,10 +406,15 @@ class Config:
     zupt_enable: bool = True
     zupt_gyro: float = 0.06      # rad/s (stricter than before)
     zupt_acc_mag: float = 0.20   # m/s^2 difference from g (stricter)
+    zupt_min_frames: int = 8     # frames required to enter "stationary"
+    zupt_release_frames: int = 3 # frames required to exit "stationary"
 
     # Bias learning when stationary
     bias_learn_enable: bool = True
     bias_learn_rate: float = 0.05
+
+    # Velocity damping (reduces drift when slightly moving)
+    vel_damping: float = 0.25    # 1/s, exponential decay of velocity
 
     # dt clamps
     dt_min: float = 0.002
@@ -588,12 +593,18 @@ class Integrator:
         self.p = np.zeros(3, dtype=float)
         self.b_aw = np.zeros(3, dtype=float)
         self.a_prev = np.zeros(3, dtype=float)
+        self.stationary = False
+        self.stationary_count = 0
+        self.moving_count = 0
 
     def reset(self) -> None:
         self.v[:] = 0.0
         self.p[:] = 0.0
         self.b_aw[:] = 0.0
         self.a_prev[:] = 0.0
+        self.stationary = False
+        self.stationary_count = 0
+        self.moving_count = 0
 
     def zupt(self, a_body: np.ndarray, omega: np.ndarray, residual_ok: bool) -> bool:
         """
@@ -602,6 +613,7 @@ class Integrator:
         - accel magnitude close to g
         - rigid-body residuals ok
 
+        Uses a small hysteresis window so "still" doesn't flicker.
         If stationary, we clamp v=0.
         """
         if not cfg.zupt_enable:
@@ -611,9 +623,20 @@ class Integrator:
                 abs(safe_norm(a_body) - cfg.g) < cfg.zupt_acc_mag and
                 residual_ok)
         if cond:
+            self.stationary_count += 1
+            self.moving_count = 0
+        else:
+            self.moving_count += 1
+            self.stationary_count = 0
+
+        if not self.stationary and self.stationary_count >= cfg.zupt_min_frames:
+            self.stationary = True
+        elif self.stationary and self.moving_count >= cfg.zupt_release_frames:
+            self.stationary = False
+
+        if self.stationary:
             self.v[:] = 0.0
-            return True
-        return False
+        return self.stationary
 
     def step(self, a_body: np.ndarray, Rwb: np.ndarray, dt: float, stationary: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -640,6 +663,8 @@ class Integrator:
 
         if not stationary:
             self.v += 0.5 * (self.a_prev + a_lin) * dt
+            if cfg.vel_damping > 0.0:
+                self.v *= math.exp(-cfg.vel_damping * dt)
 
         self.p += self.v * dt
         self.a_prev = a_lin
